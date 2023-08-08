@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <string.h>
 #include <unistd.h>
+#include <ifaddrs.h>
 #include <net/if.h>
 #include <arpa/inet.h>
 #include <linux/if_packet.h>
@@ -18,6 +19,7 @@ enum {
 	INVALID_IP_FAILURE,
 	INVALID_MAC_FAILURE,
 	SOCKET_FAILURE,
+	GETIFADDRS_FAILURE,
 	RECVFROM_FAILURE,
 	SENDTO_FAILURE,
 };
@@ -84,11 +86,6 @@ int main(int argc, char **argv) {
 	char const * const target_ip  = argv[3];
 	char const * const target_mac = argv[4];
 
-	(void) source_ip;
-	(void) source_mac;
-	(void) target_ip;
-	(void) target_mac;
-
 	int sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
 
 	if (sock == -1) {
@@ -96,13 +93,32 @@ int main(int argc, char **argv) {
 		return SOCKET_FAILURE;
 	}
 
+	struct ifaddrs * addresses, * address;
+	char interface[100];
+
+	if (getifaddrs(&addresses) == -1) {
+		perror("getifaddrs");
+		return GETIFADDRS_FAILURE;
+	}
+
+	for (address = addresses; address != NULL; address = address->ifa_next) {
+		if (address->ifa_addr == NULL) continue;
+		if (address->ifa_addr->sa_family != AF_PACKET) continue;
+		if (strcmp(address->ifa_name, "lo") == 0) continue;
+		strcpy(interface, address->ifa_name);
+		break;
+	}
+
+	freeifaddrs(addresses);
+	printf("Interface: %s\n", interface);
+
 	ssize_t bytes_read;
 	struct sockaddr saddr;
 	socklen_t saddr_len = sizeof(saddr);
 	char buffer[BUFFER_SIZE];
 
 
-	printf("Waiting for ARP request from %s...\n", target_ip);
+	printf("Waiting for ARP request (from %s to %s)...\n", target_ip, source_ip);
 
 	while (true) {
 
@@ -124,16 +140,15 @@ int main(int argc, char **argv) {
 		if (ntohs(arp->ar_op) != ARPOP_REQUEST) continue;
 
 		char _source_ip[INET_ADDRSTRLEN];
-		char _source_mac[18];
-		char _target_ip[INET_ADDRSTRLEN];
-		char _target_mac[18];
-
 		inet_ntop(AF_INET, buffer + sizeof(struct ether_header) + sizeof(struct arphdr) + 6, _source_ip, INET_ADDRSTRLEN);
-		ether_ntoa_r((struct ether_addr *) (buffer + sizeof(struct ether_header) + 8), _source_mac);
-		inet_ntop(AF_INET, buffer + sizeof(struct ether_header) + sizeof(struct arphdr) + 16, _target_ip, INET_ADDRSTRLEN);
-
 		if (strcmp(target_ip, _source_ip) != 0) continue;
+
+		char _source_mac[18];
+		ether_ntoa_r((struct ether_addr *) (buffer + sizeof(struct ether_header) + 8), _source_mac);
 		if (strcmp(target_mac, _source_mac) != 0) continue;
+
+		char _target_ip[INET_ADDRSTRLEN];
+		inet_ntop(AF_INET, buffer + sizeof(struct ether_header) + sizeof(struct arphdr) + 16, _target_ip, INET_ADDRSTRLEN);
 		if (strcmp(source_ip, _target_ip) != 0) continue;
 
 		printf("ARP request received\n");
@@ -161,16 +176,11 @@ int main(int argc, char **argv) {
 		bzero(&saddr_ll, saddr_ll_len);
 
 		saddr_ll.sll_family = AF_PACKET;
-		saddr_ll.sll_ifindex = if_nametoindex("enp0s31f6");
+		saddr_ll.sll_ifindex = if_nametoindex(interface);
 		saddr_ll.sll_protocol = htons(ETH_P_ALL);
 
 		if (ntohs(eth_reply->ether_type) != ETHERTYPE_ARP) continue;
 		if (ntohs(arp_reply->ar_op) != ARPOP_REPLY) continue;
-
-		bzero(_source_ip, INET_ADDRSTRLEN);
-		bzero(_source_mac, 18);
-		bzero(_target_ip, INET_ADDRSTRLEN);
-		bzero(_target_mac, 18);
 
 		char mac[6];
 		parseMacAddress(source_mac, mac);
@@ -179,11 +189,6 @@ int main(int argc, char **argv) {
 		memcpy(reply + sizeof(struct ether_header) + sizeof(struct arphdr) + 16, buffer + sizeof(struct ether_header) + sizeof(struct arphdr) + 6, 4);
 		memcpy(reply + sizeof(struct ether_header) + 8, mac, ETH_ALEN);
 		memcpy(reply + sizeof(struct ether_header) + 18, buffer + sizeof(struct ether_header) + 8, ETH_ALEN);
-
-		inet_ntop(AF_INET, reply + sizeof(struct ether_header) + sizeof(struct arphdr) + 6, _source_ip, INET_ADDRSTRLEN);
-		ether_ntoa_r((struct ether_addr *) (reply + sizeof(struct ether_header) + 8), _source_mac);
-		inet_ntop(AF_INET, reply + sizeof(struct ether_header) + sizeof(struct arphdr) + 16, _target_ip, INET_ADDRSTRLEN);
-		ether_ntoa_r((struct ether_addr *) (reply + sizeof(struct ether_header) + 18), _target_mac);
 
 		ssize_t bytes_sent = sendto(sock, reply, sizeof(struct ether_header) + sizeof(struct arphdr) + 20, 0, (struct sockaddr *) &saddr_ll, saddr_ll_len);
 
